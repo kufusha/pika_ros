@@ -39,4 +39,8 @@ pika 遥操作：https://github.com/agilexrobotics/PikaAnyArm
 - 操作系统：Ubuntu22.04
 - ROS：humble
 
+## G1 + PIKA リターゲティング
+
+Unitree G1 + PIKA向けのデータ変換、URDF表示、MuJoCo検証、実機スモークテストは
+[docs/G1_PIKA_RETARGETING.md](docs/G1_PIKA_RETARGETING.md) を参照してください。
 
