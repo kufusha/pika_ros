@@ -3,6 +3,9 @@
 この文書は、PIKA収録データをUnitree G1 + PIKAへ変換し、MuJoCoで検証してから
 学習・実機推論へ進むための再現手順です。
 
+リターゲット処理だけをすぐに実行する場合は
+[G1_PIKA_RETARGET_QUICKSTART.md](G1_PIKA_RETARGET_QUICKSTART.md) を先に参照してください。
+
 ## 1. 構成と前提
 
 想定するワークスペース構成です。
