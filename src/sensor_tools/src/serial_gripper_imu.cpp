@@ -25,8 +25,8 @@
 #include <data_msgs/srv/capture_service.hpp>
 #include <data_msgs/msg/capture_status.hpp>
 #include <data_msgs/msg/teleop_status.hpp>
-#include <data_msgs/msg/localization_status.hpp>
 #include <data_msgs/msg/arm_control_status.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include "jsoncpp/json/json.h"
 
@@ -105,7 +105,7 @@ class RosOperator: public rclcpp::Node{
 
 	rclcpp::Subscription<data_msgs::msg::CaptureStatus>::SharedPtr subDataCaptureStatus;
 	rclcpp::Subscription<data_msgs::msg::TeleopStatus>::SharedPtr subTeleopStatus;
-	rclcpp::Subscription<data_msgs::msg::LocalizationStatus>::SharedPtr subLocalizationStatus;
+	rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr subLocalizationStatus;
 	rclcpp::Subscription<data_msgs::msg::ArmControlStatus>::SharedPtr subArmControlStatus;
 
 	rclcpp::Client<data_msgs::srv::CaptureService>::SharedPtr client;
@@ -274,7 +274,7 @@ class RosOperator: public rclcpp::Node{
 				pubArmJointStateWithGripper = create_publisher<sensor_msgs::msg::JointState>("/joint_state_gripper", 1);
 				subDataCaptureStatus = this->create_subscription<data_msgs::msg::CaptureStatus>("/data_capture_status", 1, std::bind(&RosOperator::dataCaptureStatusHandler, this, std::placeholders::_1));
 				subTeleopStatus = this->create_subscription<data_msgs::msg::TeleopStatus>("/teleop_status", 1, std::bind(&RosOperator::teleopStatusHandler, this, std::placeholders::_1));
-				subLocalizationStatus = this->create_subscription<data_msgs::msg::LocalizationStatus>("/localization_status", 1, std::bind(&RosOperator::localizationStatusHandler, this, std::placeholders::_1));
+				subLocalizationStatus = this->create_subscription<std_msgs::msg::Bool>("/localization_status", 1, std::bind(&RosOperator::localizationStatusHandler, this, std::placeholders::_1));
 				subArmControlStatus = this->create_subscription<data_msgs::msg::ArmControlStatus>("/arm_control_status", 1, std::bind(&RosOperator::armControlStatusHandler, this, std::placeholders::_1));
 
 				client = this->create_client<data_msgs::srv::CaptureService>("/data_tools_dataCapture/capture_service");
@@ -383,9 +383,9 @@ class RosOperator: public rclcpp::Node{
 		}
 	}
 
-	void localizationStatusHandler(const data_msgs::msg::LocalizationStatus::SharedPtr msg){
+	void localizationStatusHandler(const std_msgs::msg::Bool::SharedPtr msg){
 		std::lock_guard<std::mutex> lock(colorStatusMtx);
-		if(msg->accurate){
+		if(msg->data){
 			colorStatus[COLOR_RED] = false;
 		}else{
 			colorStatus[COLOR_RED] = true;
