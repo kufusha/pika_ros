@@ -23,7 +23,7 @@ import torch
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.act.configuration_act import ACTConfig  # noqa: F401 - registers "act"
-from lerobot.policies.act.processor_act import make_act_pre_post_processors
+from lerobot.policies.pi0.configuration_pi0 import PI0Config  # noqa: F401 - registers "pi0"
 from lerobot.policies.factory import make_policy
 from lerobot.robots.unitree_g1.g1_utils import G1_29_JointArmIndex
 from lerobot.robots.unitree_g1.unitree_g1 import UnitreeG1
@@ -118,7 +118,7 @@ class RightArmTrackingServo:
         correction_step_rad: float,
         max_correction_rad: float,
         tracking_error_limit_rad: float,
-        max_expected_deviation_rad: float,
+        max_expected_deviation_rad: float | None,
     ) -> None:
         self.robot = robot
         self.ik = ik
@@ -160,6 +160,29 @@ class RightArmTrackingServo:
         self._latest_error = np.zeros(7, dtype=np.float64)
 
     def start(self) -> None:
+        # Do not command toward a state snapshot captured before model loading,
+        # camera preflight, or operator confirmation. Prime from the latest G1
+        # state so engaging the hold cannot immediately trip the error guard.
+        observed = UnitreeG1.get_observation(self.robot)
+        observed_right = np.asarray(
+            [float(observed[key]) for _, key in RIGHT_ARM_PAIRS], dtype=np.float64
+        )
+        if not np.all(np.isfinite(observed_right)):
+            raise RuntimeError("right-arm servo received a non-finite initial observation")
+        with self._lock:
+            self._hold_action = {
+                key: float(value) for key, value in observed.items() if key.endswith(".q")
+            }
+            self._command_origin = observed_right.copy()
+            self._expected_origin = observed_right.copy()
+            self._expected_target = observed_right.copy()
+            self._nominal_target = observed_right.copy()
+            self._correction.fill(0.0)
+            self._correction_enabled = False
+            self._latest_observed = observed_right.copy()
+            self._latest_command = observed_right.copy()
+            self._latest_error.fill(0.0)
+        print("TRACKING_SERVO: primed from current right-arm state", flush=True)
         self._thread = threading.Thread(target=self._run, name="g1-right-arm-servo", daemon=True)
         self._thread.start()
 
@@ -182,9 +205,14 @@ class RightArmTrackingServo:
         expected = np.asarray(expected_right, dtype=np.float64)
         if expected.shape != (7,):
             raise ValueError(f"expected a 7D right-arm target, got {expected.shape}")
+        if not np.all(np.isfinite(expected)):
+            raise RuntimeError("right-arm servo target contains a non-finite value")
         with self._lock:
             deviation = expected - self._expected_origin
-            if float(np.max(np.abs(deviation))) > self.max_expected_deviation_rad + 1e-9:
+            if (
+                self.max_expected_deviation_rad is not None
+                and float(np.max(np.abs(deviation))) > self.max_expected_deviation_rad + 1e-9
+            ):
                 raise RuntimeError("right-arm servo target exceeds expected joint-deviation limit")
             self._expected_target = expected.copy()
             self._nominal_target = self._command_origin + deviation
@@ -234,12 +262,13 @@ class RightArmTrackingServo:
                             self.max_correction_rad,
                         )
                     command = self._nominal_target + self._correction
-                    total_deviation = float(np.max(np.abs(command - self._command_origin)))
-                    hard_limit = self.max_expected_deviation_rad + self.max_correction_rad
-                    if total_deviation > hard_limit + 1e-9:
-                        raise RuntimeError(
-                            f"servo command deviation {total_deviation:.4f}rad exceeds {hard_limit:.4f}rad"
-                        )
+                    if self.max_expected_deviation_rad is not None:
+                        total_deviation = float(np.max(np.abs(command - self._command_origin)))
+                        hard_limit = self.max_expected_deviation_rad + self.max_correction_rad
+                        if total_deviation > hard_limit + 1e-9:
+                            raise RuntimeError(
+                                f"servo command deviation {total_deviation:.4f}rad exceeds {hard_limit:.4f}rad"
+                            )
                     if float(np.max(np.abs(q_error))) > self.tracking_error_limit_rad:
                         raise RuntimeError(
                             f"servo tracking error {np.max(np.abs(q_error)):.4f}rad exceeds "
@@ -331,12 +360,57 @@ def matrix_to_dataset_pose6d(rot: np.ndarray) -> np.ndarray:
     )
 
 
-def prepare_batch(item: dict, camera_keys: list[str]) -> dict[str, torch.Tensor]:
+def prepare_batch(item: dict, camera_keys: list[str]) -> dict[str, Any]:
     batch = {key: value.unsqueeze(0) for key, value in item.items() if torch.is_tensor(value)}
+    if isinstance(item.get("task"), str):
+        batch["task"] = item["task"]
     for cam_key in camera_keys:
         if cam_key in batch and batch[cam_key].dtype == torch.uint8:
             batch[cam_key] = batch[cam_key].float() / 255.0
     return batch
+
+
+def print_depth_stats(label: str, depth: np.ndarray) -> None:
+    values = np.asarray(depth, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    positive = finite[finite > 0]
+    if positive.size == 0:
+        print(f"CAMERA_DIAGNOSTICS: {label}: no positive finite pixels")
+        return
+    percentiles = np.percentile(positive, [1, 5, 50, 95, 99])
+    print(
+        f"CAMERA_DIAGNOSTICS: {label}: shape={values.shape} dtype={depth.dtype} "
+        f"zero_fraction={np.mean(finite == 0):.4f} "
+        f"min={positive.min():.1f} p01={percentiles[0]:.1f} p05={percentiles[1]:.1f} "
+        f"p50={percentiles[2]:.1f} p95={percentiles[3]:.1f} "
+        f"p99={percentiles[4]:.1f} max={positive.max():.1f}",
+        flush=True,
+    )
+
+
+def write_depth_diagnostics(
+    output_dir: Path,
+    dataset_depth: np.ndarray,
+    live_depth: np.ndarray,
+    live_color_bgr: np.ndarray,
+    live_fisheye_bgr: np.ndarray,
+    cv2: Any,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print_depth_stats("dataset_depth", dataset_depth)
+    print_depth_stats("live_depth", live_depth)
+    for label, depth in (("dataset", dataset_depth), ("live", live_depth)):
+        raw = np.clip(depth, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+        preview = np.clip(depth, 0, 2000).astype(np.float32) * (255.0 / 2000.0)
+        if not cv2.imwrite(str(output_dir / f"{label}_depth.png"), raw):
+            raise RuntimeError(f"failed to write {label}_depth.png")
+        if not cv2.imwrite(str(output_dir / f"{label}_depth_preview.png"), preview.astype(np.uint8)):
+            raise RuntimeError(f"failed to write {label}_depth_preview.png")
+    if not cv2.imwrite(str(output_dir / "live_color.jpg"), live_color_bgr):
+        raise RuntimeError("failed to write live_color.jpg")
+    if not cv2.imwrite(str(output_dir / "live_fisheye.jpg"), live_fisheye_bgr):
+        raise RuntimeError("failed to write live_fisheye.jpg")
+    print(f"CAMERA_DIAGNOSTICS: wrote {output_dir}", flush=True)
 
 
 def load_policy(args: argparse.Namespace, meta_dataset: LeRobotDataset):
@@ -349,7 +423,21 @@ def load_policy(args: argparse.Namespace, meta_dataset: LeRobotDataset):
     policy = make_policy(cfg, ds_meta=meta_dataset.meta)
     policy.eval()
     policy.reset()
-    preprocessor, postprocessor = make_act_pre_post_processors(cfg, dataset_stats=meta_dataset.meta.stats)
+    if cfg.type == "act":
+        from lerobot.policies.act.processor_act import make_act_pre_post_processors
+
+        preprocessor, postprocessor = make_act_pre_post_processors(
+            cfg, dataset_stats=meta_dataset.meta.stats
+        )
+    elif cfg.type == "pi0":
+        from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
+
+        preprocessor, postprocessor = make_pi0_pre_post_processors(
+            cfg, dataset_stats=meta_dataset.meta.stats
+        )
+    else:
+        raise ValueError(f"unsupported policy type for live G1 execution: {cfg.type}")
+    print(f"POLICY: loaded type={cfg.type} from {args.policy_path}", flush=True)
     return policy, preprocessor, postprocessor
 
 
@@ -464,6 +552,8 @@ class LivePikaZMQCameras:
         port: int,
         timeout_ms: int,
         retries: int,
+        replace_rgb: bool,
+        replace_depth: bool,
         replace_fisheye: bool,
     ):
         import cv2
@@ -480,6 +570,8 @@ class LivePikaZMQCameras:
         self._timeout_ms = timeout_ms
         self._retries = retries
         self._sock = self._open_socket()
+        self._replace_rgb_enabled = replace_rgb
+        self._replace_depth_enabled = replace_depth
         self._replace_fisheye = replace_fisheye
 
     def _open_socket(self):
@@ -559,8 +651,10 @@ class LivePikaZMQCameras:
 
     def replace(self, batch: dict[str, torch.Tensor]) -> None:
         d405_color_bgr, d405_depth_u16, fisheye_bgr = self._request_frames()
-        self._replace_rgb(batch, "observation.images.pikaDepthCamera", d405_color_bgr)
-        self._replace_depth(batch, "observation.depths.pikaDepthCamera", d405_depth_u16)
+        if self._replace_rgb_enabled:
+            self._replace_rgb(batch, "observation.images.pikaDepthCamera", d405_color_bgr)
+        if self._replace_depth_enabled:
+            self._replace_depth(batch, "observation.depths.pikaDepthCamera", d405_depth_u16)
         if self._replace_fisheye:
             self._replace_rgb(batch, "observation.images.pikaFisheyeCamera", fisheye_bgr)
 
@@ -627,6 +721,11 @@ def main() -> None:
     parser.add_argument("--gripper-open-angle", type=float, default=DEFAULT_GRIPPER_OPEN_ANGLE)
     parser.add_argument("--max-joint-step", type=float, default=0.015)
     parser.add_argument("--max-joint-deviation", type=float, default=0.08)
+    parser.add_argument(
+        "--no-joint-deviation-limit",
+        action="store_true",
+        help="Disable clipping relative to the rollout's initial joint pose.",
+    )
     parser.add_argument("--max-gripper-step", type=float, default=0.04)
     parser.add_argument("--no-gripper", action="store_true", help="Do not connect or command the PIKA gripper.")
     parser.add_argument("--ik-smooth-weight", type=float, default=0.1)
@@ -636,6 +735,11 @@ def main() -> None:
     parser.add_argument("--dry-run-gripper", type=float, default=0.0)
     parser.add_argument("--print-observed", action="store_true")
     parser.add_argument("--print-tcp", action="store_true")
+    parser.add_argument(
+        "--print-action",
+        action="store_true",
+        help="Print the raw policy action and converted gripper target.",
+    )
     parser.add_argument("--observe-delay", type=float, default=0.08)
     parser.add_argument(
         "--live-state",
@@ -663,9 +767,24 @@ def main() -> None:
     parser.add_argument("--live-pika-camera-timeout-ms", type=int, default=1000)
     parser.add_argument("--live-pika-camera-retries", type=int, default=3)
     parser.add_argument(
+        "--live-pika-camera-no-rgb",
+        action="store_true",
+        help="Keep observation.images.pikaDepthCamera from the dataset.",
+    )
+    parser.add_argument(
+        "--live-pika-camera-no-depth",
+        action="store_true",
+        help="Keep observation.depths.pikaDepthCamera from the dataset.",
+    )
+    parser.add_argument(
         "--live-pika-camera-no-fisheye",
         action="store_true",
         help="Replace only D405 RGB/depth; keep observation.images.pikaFisheyeCamera from the dataset.",
+    )
+    parser.add_argument(
+        "--camera-diagnostics-dir",
+        type=Path,
+        help="Write one dataset/live camera comparison and exit without policy inference.",
     )
     parser.add_argument(
         "--hold-after-run",
@@ -714,12 +833,39 @@ def main() -> None:
         raise ValueError("--trajectory-csv is required for --action-source trajectory")
     if args.action_source == "policy" and args.policy_path is None:
         raise ValueError("--policy-path is required for --action-source policy")
+    if not args.dry_run and args.action_source == "policy":
+        required_real_policy_flags = {
+            "--use-connected-fk-start": args.use_connected_fk_start,
+            "--live-state": args.live_state,
+            "--live-pika-camera-server": args.live_pika_camera_server is not None,
+            "--tracking-servo": args.tracking_servo,
+            "--confirm-control": args.confirm_control,
+            "--hold-after-run": args.hold_after_run,
+        }
+        missing = [name for name, enabled in required_real_policy_flags.items() if not enabled]
+        if missing:
+            raise ValueError(
+                "real policy control requires these safety options: " + ", ".join(missing)
+            )
+        if args.live_pika_camera_no_rgb or args.live_pika_camera_no_fisheye:
+            raise ValueError("real policy control requires live PIKA RGB and fisheye streams")
+        if args.max_joint_step > 0.010:
+            raise ValueError("real policy --max-joint-step must be <= 0.010rad")
+        if not args.no_joint_deviation_limit and args.max_joint_deviation > 0.10:
+            raise ValueError("real policy --max-joint-deviation must be <= 0.10rad")
     if args.action_source != "trajectory" and args.trajectory_csv is not None:
         raise ValueError("--trajectory-csv requires --action-source trajectory")
     if args.trajectory_start_max_move_rad <= 0.0 or args.trajectory_max_deviation_rad <= 0.0:
         raise ValueError("trajectory movement limits must be positive")
     if (args.dry_run_left_q is None) != (args.dry_run_right_q is None):
         raise ValueError("--dry-run-left-q and --dry-run-right-q must be provided together")
+    if (
+        args.live_pika_camera_server is not None
+        and args.live_pika_camera_no_rgb
+        and args.live_pika_camera_no_depth
+        and args.live_pika_camera_no_fisheye
+    ):
+        raise ValueError("at least one live PIKA camera stream must be enabled")
     live_camera_specs = {}
     if args.live_depth_rgb_device is not None:
         live_camera_specs["observation.images.pikaDepthCamera"] = parse_opencv_device(args.live_depth_rgb_device)
@@ -747,7 +893,6 @@ def main() -> None:
             return_uint8=True,
             video_backend=args.video_backend,
         )
-        policy, preprocessor, postprocessor = load_policy(args, meta_dataset)
     elif args.action_source == "teacher":
         print("ACTION_SOURCE: replaying recorded dataset actions (policy disabled)")
     ik = G1PikaArmIK()
@@ -844,7 +989,7 @@ def main() -> None:
     print("initial right_gripper.pos:", round(current_gripper, 4))
     if args.live_state:
         print("LIVE_STATE: policy observation.state is relative identity pose + live right gripper")
-        print("LIVE_STATE: image/depth observations still come from the dataset")
+        print("LIVE_STATE: camera observations are replaced below when live camera options are enabled")
     live_cameras = None
     if live_camera_specs:
         assert dataset is not None
@@ -863,23 +1008,54 @@ def main() -> None:
             args.live_pika_camera_port,
             args.live_pika_camera_timeout_ms,
             args.live_pika_camera_retries,
+            not args.live_pika_camera_no_rgb,
+            not args.live_pika_camera_no_depth,
             not args.live_pika_camera_no_fisheye,
         )
+        live_streams = []
+        if not args.live_pika_camera_no_rgb:
+            live_streams.append("D405 RGB")
+        if not args.live_pika_camera_no_depth:
+            live_streams.append("D405 depth")
+        if not args.live_pika_camera_no_fisheye:
+            live_streams.append("DECXIN fisheye")
         print(
-            "LIVE_CAMERA: replacing D405 RGB/depth + DECXIN fisheye from "
+            f"LIVE_CAMERA: replacing {', '.join(live_streams)} from "
             f"tcp://{args.live_pika_camera_server}:{args.live_pika_camera_port}"
         )
-        if args.live_pika_camera_no_fisheye:
-            print("LIVE_CAMERA: observation.images.pikaFisheyeCamera still comes from the dataset")
     if args.print_tcp:
         print("initial right_tcp_mujoco:", np.round(connected_tcp, 4))
         print("start target_tcp_mujoco :", np.round(right_target, 4))
-    print("limits: max_joint_step", args.max_joint_step, "max_joint_deviation", args.max_joint_deviation)
+    joint_deviation_limit = None if args.no_joint_deviation_limit else args.max_joint_deviation
+    print(
+        "limits: max_joint_step",
+        args.max_joint_step,
+        "max_joint_deviation",
+        "disabled" if joint_deviation_limit is None else joint_deviation_limit,
+    )
 
     try:
         if isinstance(live_cameras, LivePikaZMQCameras):
             print("CAMERA_PREFLIGHT: checking live cameras before enabling G1 control")
             live_cameras.preflight()
+            if args.camera_diagnostics_dir is not None:
+                assert dataset is not None
+                item = dataset[args.start_index]
+                batch = prepare_batch(item, dataset.meta.camera_keys)
+                depth_key = "observation.depths.pikaDepthCamera"
+                if depth_key not in batch:
+                    raise KeyError(f"dataset has no {depth_key}")
+                dataset_depth = batch[depth_key].squeeze(0).squeeze(0).detach().cpu().numpy()
+                live_color, live_depth, live_fisheye = live_cameras._request_frames()
+                write_depth_diagnostics(
+                    args.camera_diagnostics_dir,
+                    dataset_depth,
+                    live_depth,
+                    live_color,
+                    live_fisheye,
+                    live_cameras._cv2,
+                )
+                return
         if trajectory_run is not None:
             start_move = float(np.max(np.abs(trajectory_run[0] - initial_right)))
             total_deviation = float(np.max(np.abs(trajectory_run - initial_right)))
@@ -914,7 +1090,7 @@ def main() -> None:
                 max_expected_deviation_rad=(
                     args.trajectory_max_deviation_rad
                     if args.action_source == "trajectory"
-                    else args.max_joint_deviation
+                    else joint_deviation_limit
                 ),
             )
             tracking_servo.start()
@@ -1035,6 +1211,11 @@ def main() -> None:
                         flush=True,
                     )
 
+        if args.action_source == "policy":
+            assert meta_dataset is not None
+            print("POLICY: loading after right-arm hold is active", flush=True)
+            policy, preprocessor, postprocessor = load_policy(args, meta_dataset)
+
         remaining_steps = 0 if dataset is None else max(0, len(dataset) - args.start_index)
         run_steps = (
             0
@@ -1101,11 +1282,16 @@ def main() -> None:
                 )
                 q_g1 = np.asarray(q_pin, dtype=np.float64)[ik._arm_reorder_pin_to_g1]
                 target_right = q_g1[7:14]
-                clipped_target = np.clip(
-                    target_right,
-                    initial_right - args.max_joint_deviation,
-                    initial_right + args.max_joint_deviation,
-                )
+                if not np.all(np.isfinite(target_right)):
+                    raise RuntimeError("IK returned a non-finite right-arm target")
+                if joint_deviation_limit is None:
+                    clipped_target = target_right
+                else:
+                    clipped_target = np.clip(
+                        target_right,
+                        initial_right - joint_deviation_limit,
+                        initial_right + joint_deviation_limit,
+                    )
                 sent_right = sent_right + np.clip(
                     clipped_target - sent_right,
                     -args.max_joint_step,
@@ -1117,6 +1303,14 @@ def main() -> None:
                     current_gripper
                     + np.clip(gripper_target - current_gripper, -args.max_gripper_step, args.max_gripper_step)
                 )
+
+                if args.print_action:
+                    print(
+                        f"        raw_action_gripper_width={gripper_width:.6f} "
+                        f"gripper_target_angle={gripper_target:.6f} "
+                        f"commanded_gripper_angle={current_gripper:.6f}",
+                        flush=True,
+                    )
 
                 robot_action = dict(hold_action)
                 for value, (_, key) in zip(sent_right, RIGHT_ARM_PAIRS, strict=True):
