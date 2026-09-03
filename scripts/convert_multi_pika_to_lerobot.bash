@@ -27,6 +27,8 @@ Options:
                        Convert action to current-TCP-relative future trajectory.
   --relative-action-horizon N
                        Future horizon for --relative-trajectory. Default: 1.
+  --retarget-start-pose-config FILE
+                       Canonical G1+PIKA start pose copied into dataset metadata.
 
 Example:
   ./convert_multi_pika_to_lerobot.bash \
@@ -67,6 +69,7 @@ TIME_DIFF_LIMIT="0.03"
 RESAMPLE="1"
 RELATIVE_TRAJECTORY="0"
 RELATIVE_ACTION_HORIZON="1"
+RETARGET_START_POSE_CONFIG="$SCRIPT_DIR/../config/g1_pika_retarget_start_pose.json"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -104,6 +107,8 @@ while [[ $# -gt 0 ]]; do
       RELATIVE_TRAJECTORY="1"; shift ;;
     --relative-action-horizon)
       RELATIVE_ACTION_HORIZON="$2"; shift 2 ;;
+    --retarget-start-pose-config)
+      RETARGET_START_POSE_CONFIG="$2"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -138,6 +143,13 @@ fi
 
 DATASET_DIR="$(realpath -m "$DATASET_DIR")"
 TARGET_DIR="$(realpath -m "$TARGET_DIR")"
+if [[ "$RELATIVE_TRAJECTORY" == "1" ]]; then
+  RETARGET_START_POSE_CONFIG="$(realpath -m "$RETARGET_START_POSE_CONFIG")"
+  if [[ ! -f "$RETARGET_START_POSE_CONFIG" ]]; then
+    echo "Retarget start pose config not found: $RETARGET_START_POSE_CONFIG" >&2
+    exit 1
+  fi
+fi
 
 if [[ ! -x "$LEROBOT_PY" ]]; then
   echo "LeRobot Python not found: $LEROBOT_PY" >&2
@@ -179,6 +191,9 @@ echo "Dataset dir : $DATASET_DIR"
 echo "Episodes    : ${EPISODES[*]}"
 echo "Target dir  : $TARGET_DIR"
 echo "FPS         : $FPS"
+if [[ "$RELATIVE_TRAJECTORY" == "1" ]]; then
+  echo "Start pose  : $RETARGET_START_POSE_CONFIG"
+fi
 echo
 
 if [[ "$RUN_SYNC" == "1" ]]; then
@@ -271,5 +286,13 @@ fi
   "$LEROBOT_PY" "${LEROBOT_ARGS[@]}"
 )
 
+if [[ "$RELATIVE_TRAJECTORY" == "1" ]]; then
+  mkdir -p "$TARGET_DIR/meta"
+  cp "$RETARGET_START_POSE_CONFIG" "$TARGET_DIR/meta/retarget_start_pose.json"
+fi
+
 echo
 echo "Done: $TARGET_DIR"
+if [[ "$RELATIVE_TRAJECTORY" == "1" ]]; then
+  echo "Start pose metadata: $TARGET_DIR/meta/retarget_start_pose.json"
+fi

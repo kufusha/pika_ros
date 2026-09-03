@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "name": "g1_pika_urdf_zero_start_v1",
+  "description": "Canonical G1+PIKA start with every reduced-model arm joint at zero radians.",
+  "base_frame": "pelvis",
+  "mujoco_world_pelvis_z_m": 0.793,
+  "left_arm_q_g1_rad": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "right_arm_q_g1_rad": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "right_pika_tcp": {
+    "position_pelvis_m": [
+      0.379774281,
+      -0.148617218,
+      0.095222941
+    ],
+    "position_mujoco_world_m": [
+      0.379774281,
+      -0.148617218,
+      0.888222941
+    ],
+    "quaternion_xyzw": [
+      0.7071248133,
+      0.0003692098,
+      0.7070886136,
+      0.0002337141
+    ],
+    "rotation_matrix": [
+      [0.00005111239549, 0.0001916417363, 0.9999999803],
+      [0.0008526679889, -0.9999996181, 0.0001915980850],
+      [0.9999996352, 0.0008526581791, -0.00005127578275]
+    ],
+    "rpy_xyz_rad_diagnostic_only": [
+      1.630860379,
+      -1.569942128,
+      1.510923894
+    ]
+  },
+  "fk_validation": {
+    "position_tolerance_m": 1e-05,
+    "rotation_tolerance_rad": 0.0001
+  }
+}

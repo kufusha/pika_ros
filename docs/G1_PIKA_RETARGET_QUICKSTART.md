@@ -20,6 +20,54 @@ right_pika_tcp +Y = グリッパ開閉方向
 right_pika_tcp +Z = グリッパ前方
 ```
 
+## 基準開始姿勢
+
+ここでの「G1デフォルトポーズ」は、G1の全関節を `0 rad` にしたURDF姿勢です。
+この姿勢における `right_pika_tcp` は次の値です。
+
+```text
+right q = [0, 0, 0, 0, 0, 0, 0]
+position (pelvis) = [ 0.379774281, -0.148617218, 0.095222941 ] m
+position (MuJoCo world, pelvis z=0.793)
+                  = [ 0.379774281, -0.148617218, 0.888222941 ] m
+quaternion (xyzw) = [ 0.7071248133, 0.0003692098,
+                       0.7070886136, 0.0002337141 ]
+```
+
+リターゲットの開始姿勢は
+`config/g1_pika_retarget_start_pose.json` を正本とし、左右腕とも全関節0に固定します。
+
+```text
+left q  = [0, 0, 0, 0, 0, 0, 0]
+right q = [0, 0, 0, 0, 0, 0, 0]
+```
+
+現在のURDFでこの値が再現されることを確認します。
+
+```bash
+cd "$WORKSPACE/src/pika_ros"
+PYTHONPATH="$WORKSPACE/src/lerobot/src" \
+G1_PIKA_URDF="$WORKSPACE/src/g1_pika_description/urdf/g1_29dof_pika.urdf" \
+python scripts/print_g1_pika_start_pose.py
+```
+
+最後に `FK validation: OK` が必要です。RPYは特異姿勢付近で表現が不安定なため、
+姿勢の正本にはJSON内のquaternionとrotation matrixを使います。
+
+相対actionはPIKA Stationの絶対位置を使いません。PIKAの初期姿勢を
+`T_PIKA(0)`、G1の上記開始姿勢を `T_G1_start` とすると、概念上の目標は
+
+```text
+T_G1(t) = T_G1_start * inverse(T_PIKA(0)) * T_PIKA(t)
+```
+
+です。したがって収録ごとのStation配置差は相対変換で相殺され、G1側は常に
+`T_G1_start` から開始します。
+
+注意: 既存episode 10の相対軌道を0姿勢から解いた試験ではstep 24の位置誤差が
+`0.008452 m` となり、許容値 `0.005 m` を超えました。データセット再生成後は
+代表episodeの全step IK検証を行い、必要なら軌道スケールまたは開始位置を再検討します。
+
 ## 1. 初回セットアップ
 
 次の配置を前提とします。
@@ -88,6 +136,13 @@ scripts/convert_multi_pika_to_lerobot.bash \
   --reuse-hdf5 \
   --relative-trajectory \
   --relative-action-horizon 1
+```
+
+変換後は次のファイルも生成されます。teacher/policyのMuJoCoラッパーはこの値を
+自動で読み、現在のURDFとのFK照合に失敗した場合は処理を停止します。
+
+```text
+$WORKSPACE/datasets/g1_pika_relative/meta/retarget_start_pose.json
 ```
 
 `LEROBOT_PY` の例:

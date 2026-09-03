@@ -87,6 +87,26 @@ scripts/convert_multi_pika_to_lerobot.bash \
 変換データのactionは相対TCPの `xyz + rotation-6D + gripper`（10次元）です。
 状態は相対基準姿勢とグリッパを表す10次元で、現在の実装は視覚主体の学習を想定します。
 
+変換時にはG1全関節0の開始姿勢
+`config/g1_pika_retarget_start_pose.json` が
+`<dataset>/meta/retarget_start_pose.json` にコピーされます。開始姿勢を変更する場合は
+関節値だけでなく、同JSONのTCP位置・回転行列を現在のURDFのFKから更新し、次を実行して
+`FK validation: OK` を確認してください。
+
+```bash
+PYTHONPATH=<workspace>/src/lerobot/src \
+G1_PIKA_URDF=<workspace>/src/g1_pika_description/urdf/g1_29dof_pika.urdf \
+python scripts/print_g1_pika_start_pose.py
+```
+
+基準右TCPはpelvis座標で
+`[0.379774281, -0.148617218, 0.095222941] m`、姿勢quaternion (xyzw) は
+`[0.7071248133, 0.0003692098, 0.7070886136, 0.0002337141]` です。
+相対軌道はこの基準姿勢から積分されるため、PIKA Stationの絶対配置は開始位置へ加算しません。
+
+既存episode 10の相対軌道では全関節0開始時にIK位置誤差が最大許容値を超えたため、
+再生成後に代表episodeの全step到達性を必ず確認してください。
+
 ## 4. Teacher軌道のMuJoCo検証
 
 まず代表episodeを4視点、TCP/IKラベル付きで確認します。
