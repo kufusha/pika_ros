@@ -1,8 +1,8 @@
 
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-camera_fps=30
-camera_width=640
-camera_height=480
+camera_fps=${PIKA_CAMERA_FPS:-30}
+camera_width=${PIKA_CAMERA_WIDTH:-640}
+camera_height=${PIKA_CAMERA_HEIGHT:-480}
 l_depth_camera_no=230322272110
 r_depth_camera_no=230322270988
 
@@ -19,4 +19,3 @@ if [ -n "$1" ]; then
 else
     source $SCRIPT_DIR/../install/setup.bash && ros2 launch sensor_tools open_multi_sensor.launch.py l_depth_camera_no:=_$l_depth_camera_no r_depth_camera_no:=_$r_depth_camera_no l_serial_port:=$l_serial_port r_serial_port:=$r_serial_port l_fisheye_port:=$l_fisheye_port r_fisheye_port:=$r_fisheye_port camera_fps:=$camera_fps camera_width:=$camera_width camera_height:=$camera_height camera_profile:=$camera_width,$camera_height,$camera_fps
 fi
-                
