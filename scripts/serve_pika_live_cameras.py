@@ -10,6 +10,7 @@ Publishes the camera inputs expected by the policy:
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import threading
 import time
@@ -26,8 +27,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5562)
-    parser.add_argument("--d405-serial", default="315122271825")
-    parser.add_argument("--fisheye-device", default="/dev/video6")
+    parser.add_argument(
+        "--d405-serial",
+        default=os.environ.get("PIKA_D405_SERIAL"),
+        help="D405 serial number (or set PIKA_D405_SERIAL).",
+    )
+    parser.add_argument(
+        "--fisheye-device",
+        default=os.environ.get("PIKA_FISHEYE_DEVICE"),
+        help="OpenCV device path/index (or set PIKA_FISHEYE_DEVICE).",
+    )
     parser.add_argument("--no-fisheye", action="store_true", help="Serve only D405 RGB/depth.")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
@@ -74,6 +83,9 @@ class PikaLiveCameraSource:
         self._latest: dict[str, Any] = {}
         self._thread: threading.Thread | None = None
         self._pipeline: rs.pipeline | None = None
+        self._align: rs.align | None = None
+        self._pipeline_started = False
+        self._depth_to_mm = 1.0
         self._fisheye: cv2.VideoCapture | None = None
 
     def start(self) -> None:
@@ -83,7 +95,11 @@ class PikaLiveCameraSource:
             config.enable_stream(rs.stream.color, self.args.width, self.args.height, rs.format.bgr8, self.args.fps)
             config.enable_stream(rs.stream.depth, self.args.width, self.args.height, rs.format.z16, self.args.fps)
             self._pipeline = rs.pipeline()
-            self._pipeline.start(config)
+            profile = self._pipeline.start(config)
+            self._pipeline_started = True
+            self._align = rs.align(rs.stream.color)
+            depth_sensor = profile.get_device().first_depth_sensor()
+            self._depth_to_mm = float(depth_sensor.get_depth_scale()) * 1000.0
 
             if not self.args.no_fisheye:
                 self._fisheye = open_opencv_camera(
@@ -104,8 +120,9 @@ class PikaLiveCameraSource:
             self._thread.join(timeout=2.0)
         if self._fisheye is not None:
             self._fisheye.release()
-        if self._pipeline is not None:
+        if self._pipeline is not None and self._pipeline_started:
             self._pipeline.stop()
+            self._pipeline_started = False
 
     def _capture_loop(self) -> None:
         assert self._pipeline is not None
@@ -117,8 +134,10 @@ class PikaLiveCameraSource:
 
         while not self._stop.is_set():
             frames = self._pipeline.wait_for_frames(5000)
-            color_frame = frames.get_color_frame()
-            depth_frame = frames.get_depth_frame()
+            assert self._align is not None
+            aligned_frames = self._align.process(frames)
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
             fisheye_bgr = None
             if self._fisheye is not None:
                 ok, fisheye_bgr = self._fisheye.read()
@@ -128,7 +147,9 @@ class PikaLiveCameraSource:
                 continue
 
             d405_color_bgr = np.asanyarray(color_frame.get_data()).copy()
-            d405_depth = np.asanyarray(depth_frame.get_data()).copy()
+            d405_depth_raw = np.asanyarray(depth_frame.get_data())
+            d405_depth = np.rint(d405_depth_raw.astype(np.float32) * self._depth_to_mm)
+            d405_depth = np.clip(d405_depth, 0, np.iinfo(np.uint16).max).astype(np.uint16)
             if fisheye_bgr is None:
                 fisheye_bgr = np.zeros_like(d405_color_bgr)
             with self._lock:
@@ -157,6 +178,8 @@ class PikaLiveCameraSource:
             f"\"stamp\":{latest['stamp']:.6f},"
             f"\"d405_color_shape\":{list(latest['d405_color_bgr'].shape)},"
             f"\"d405_depth_shape\":{list(latest['d405_depth_u16'].shape)},"
+            "\"d405_depth_aligned_to_color\":true,"
+            f"\"d405_depth_to_mm\":{self._depth_to_mm:.9g},"
             f"\"fisheye_shape\":{list(latest['fisheye_bgr'].shape)},"
             f"\"fisheye_enabled\":{str(not self.args.no_fisheye).lower()}"
             "}"
@@ -165,7 +188,12 @@ class PikaLiveCameraSource:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.d405_serial:
+        parser.error("--d405-serial or PIKA_D405_SERIAL is required")
+    if not args.no_fisheye and not args.fisheye_device:
+        parser.error("--fisheye-device or PIKA_FISHEYE_DEVICE is required unless --no-fisheye is set")
     source = PikaLiveCameraSource(args)
     shutdown = threading.Event()
 
@@ -181,6 +209,8 @@ def main() -> None:
     sock.bind(f"tcp://{args.host}:{args.port}")
     print(f"PIKA live camera server listening on tcp://{args.host}:{args.port}")
     print(f"D405 serial: {args.d405_serial}")
+    print("D405 depth: aligned to color")
+    print(f"D405 depth scale: {source._depth_to_mm:.9g} mm/count")
     if args.no_fisheye:
         print("DECXIN fisheye: disabled")
     else:
