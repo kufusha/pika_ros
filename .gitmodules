@@ -5,7 +5,7 @@
 [submodule "src/data_tools"]
 	path = src/data_tools
 	url = https://github.com/kufusha/data_tools.git
-	branch = ros2
+	branch = feature/relative-trajectory-conversion
 [submodule "src/PikaAnyArm"]
 	path = src/PikaAnyArm
 	url = https://github.com/agilexrobotics/PikaAnyArm.git
