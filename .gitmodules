@@ -8,4 +8,5 @@
 	branch = feature/relative-trajectory-conversion
 [submodule "src/PikaAnyArm"]
 	path = src/PikaAnyArm
-	url = https://github.com/agilexrobotics/PikaAnyArm.git
+	url = https://github.com/kufusha/PikaAnyArm.git
+	branch = feature/add-piper-description-package
