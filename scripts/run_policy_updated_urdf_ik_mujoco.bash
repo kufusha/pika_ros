@@ -12,9 +12,10 @@ START_INDEX="${START_INDEX:-0}"
 STEPS="${STEPS:-all}"
 FPS="${FPS:-30}"
 OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE_DIR/videos/policy_updated_urdf_episode${EPISODE}}"
-
-INITIAL_LEFT_Q="${INITIAL_LEFT_Q:-0.1092 0.0023 1.2527 1.2047 0.8746 0.1338 -0.36}"
-INITIAL_RIGHT_Q="${INITIAL_RIGHT_Q:-0.73653047 -0.80950896 0.38782465 0.08547420 0.47622498 -0.84839036 0.42185469}"
+START_POSE_CONFIG="${START_POSE_CONFIG:-$DATASET_ROOT/meta/retarget_start_pose.json}"
+if [[ ! -f "$START_POSE_CONFIG" ]]; then
+  START_POSE_CONFIG="$PIKA_ROS_DIR/config/g1_pika_retarget_start_pose.json"
+fi
 ORIENTATION_WEIGHT="${ORIENTATION_WEIGHT:-1.0}"
 UNITREE_IK_METHOD="${UNITREE_IK_METHOD:-scipy-right}"
 IK_POSITION_TOLERANCE_M="${IK_POSITION_TOLERANCE_M:-0.005}"
@@ -23,6 +24,17 @@ CAMERA_LAYOUT="${CAMERA_LAYOUT:-four}"
 DEVICE="${DEVICE:-cpu}"
 POLICY_ACTION_STEPS="${POLICY_ACTION_STEPS:-1}"
 FAIL_ON_IK_ERROR="${FAIL_ON_IK_ERROR:-0}"
+POLICY_STATE_SOURCE="${POLICY_STATE_SOURCE:-relative-rollout}"
+REPO_ID="${REPO_ID:-data}"
+G1_MUJOCO_XML="${G1_MUJOCO_XML:-}"
+if [[ -z "$G1_MUJOCO_XML" ]]; then
+  G1_MUJOCO_XML="$(find "$HOME/.cache/huggingface/hub/models--lerobot--unitree-g1-mujoco/snapshots" \
+    -path '*/assets/g1_29dof_no_hand.xml' -print -quit 2>/dev/null || true)"
+fi
+if [[ ! -f "$G1_MUJOCO_XML" ]]; then
+  echo "G1 MuJoCo XML not found; set G1_MUJOCO_XML explicitly" >&2
+  exit 2
+fi
 
 if [[ "$STEPS" == "all" ]]; then
   STEPS_ARG=1000000000
@@ -40,6 +52,9 @@ echo "POLICY_PATH : $POLICY_PATH"
 echo "DATASET_ROOT: $DATASET_ROOT"
 echo "EPISODE     : $EPISODE"
 echo "OUTPUT_DIR  : $OUTPUT_DIR"
+echo "START_POSE  : $START_POSE_CONFIG"
+echo "STATE_SOURCE: $POLICY_STATE_SOURCE"
+echo "G1_XML      : $G1_MUJOCO_XML"
 
 EXTRA_ARGS=()
 if [[ "$FAIL_ON_IK_ERROR" != "0" ]]; then
@@ -55,6 +70,8 @@ env -u PYTHONPATH -u AMENT_PREFIX_PATH -u COLCON_PREFIX_PATH \
   conda run --no-capture-output -n "$CONDA_ENV" \
     python "$SCRIPT_DIR/g1_pika_mujoco_retarget.py" \
       --dataset-root "$DATASET_ROOT" \
+      --repo-id "$REPO_ID" \
+      --g1-xml "$G1_MUJOCO_XML" \
       --policy-path "$POLICY_PATH" \
       --source policy \
       --episode "$EPISODE" \
@@ -62,14 +79,14 @@ env -u PYTHONPATH -u AMENT_PREFIX_PATH -u COLCON_PREFIX_PATH \
       --steps "$STEPS_ARG" \
       --device "$DEVICE" \
       --policy-action-steps "$POLICY_ACTION_STEPS" \
+      --policy-state-source "$POLICY_STATE_SOURCE" \
       --single-arm right \
       --ik-backend unitree \
       --unitree-ik-method "$UNITREE_IK_METHOD" \
       --motion-scale-xyz "1 1 1" \
       --action-reference relative-delta \
       --relative-delta-frame local \
-      --initial-left-q "$INITIAL_LEFT_Q" \
-      --initial-right-q "$INITIAL_RIGHT_Q" \
+      --start-pose-config "$START_POSE_CONFIG" \
       --use-initial-q-as-work-start \
       --left-pika-mount-euler "0 3.14159265 0" \
       --pika-euler "0 0 0" \

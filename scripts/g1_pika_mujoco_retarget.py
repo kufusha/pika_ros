@@ -6,25 +6,67 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import json
 import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import cv2
-import imageio.v2 as imageio
 import mujoco
 import numpy as np
 import torch
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies import make_policy, make_pre_post_processors
+from lerobot.policies import make_policy
+from lerobot.policies.act.configuration_act import ACTConfig  # noqa: F401 - registers "act"
+from lerobot.policies.pi0.configuration_pi0 import PI0Config  # noqa: F401 - registers "pi0"
 
 
 PIKA_ROS_DIR = Path(__file__).resolve().parents[1]
-PIKA_MESH_DIR = PIKA_ROS_DIR / "src/PikaAnyArm/piper/piper_ros/piper_description/meshes"
+PIKA_MESH_DIR = Path(
+    os.environ.get(
+        "PIKA_MESH_DIR",
+        PIKA_ROS_DIR / "src/PikaAnyArm/piper/piper_ros/piper_description/meshes",
+    )
+).expanduser()
 TCP_OFFSET = np.array([0.18, 0.0, 0.0], dtype=np.float64)
+
+
+def load_start_pose_config(path: Path) -> dict:
+    resolved = path.expanduser().absolute()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"retarget start pose config was not found: {resolved}")
+    config = json.loads(resolved.read_text())
+    for key in ("name", "left_arm_q_g1_rad", "right_arm_q_g1_rad", "right_pika_tcp"):
+        if key not in config:
+            raise ValueError(f"missing {key!r} in start pose config: {resolved}")
+    config["_path"] = resolved
+    return config
+
+
+def validate_start_pose_fk(unitree_ik, config: dict, q_g1: np.ndarray) -> tuple[float, float]:
+    expected_position = np.asarray(config["right_pika_tcp"]["position_pelvis_m"], dtype=np.float64)
+    expected_rotation = np.asarray(config["right_pika_tcp"]["rotation_matrix"], dtype=np.float64)
+    q_pin = q_g1[unitree_ik._arm_reorder_g1_to_pin]
+    pin_data = unitree_ik.reduced_robot.model.createData()
+    unitree_ik._pin.framesForwardKinematics(unitree_ik.reduced_robot.model, pin_data, q_pin)
+    unitree_ik._pin.updateFramePlacements(unitree_ik.reduced_robot.model, pin_data)
+    actual = pin_data.oMf[unitree_ik.R_hand_id].homogeneous
+    position_error = float(np.linalg.norm(actual[:3, 3] - expected_position))
+    rotation_error_rad = float(np.linalg.norm(rotation_error(expected_rotation, actual[:3, :3])))
+    tolerances = config.get("fk_validation", {})
+    position_tolerance = float(tolerances.get("position_tolerance_m", 1e-5))
+    rotation_tolerance = float(tolerances.get("rotation_tolerance_rad", 1e-5))
+    if position_error > position_tolerance or rotation_error_rad > rotation_tolerance:
+        raise RuntimeError(
+            "retarget start pose does not match the current G1+PIKA URDF: "
+            f"position_error={position_error:.9f}m, "
+            f"rotation_error={rotation_error_rad:.9f}rad, config={config['_path']}"
+        )
+    return position_error, rotation_error_rad
 
 
 def resolve_g1_xml(explicit_path: Path | None) -> Path:
@@ -44,7 +86,9 @@ def resolve_g1_xml(explicit_path: Path | None) -> Path:
     )
     for candidate in candidates:
         if candidate.is_file():
-            return candidate.resolve()
+            # Keep the snapshot path intact. Hugging Face assets are symlinks to
+            # blobs, while mesh paths are relative to the snapshot assets dir.
+            return candidate.absolute()
 
     searched = "\n  ".join(str(path) for path in candidates) or "(no candidates)"
     raise FileNotFoundError(
@@ -309,8 +353,10 @@ def prepare_scene_xml(
     return scene_xml
 
 
-def prepare_batch(item: dict, camera_keys: list[str]) -> dict[str, torch.Tensor]:
+def prepare_batch(item: dict, camera_keys: list[str]) -> dict[str, Any]:
     batch = {key: value.unsqueeze(0) for key, value in item.items() if torch.is_tensor(value)}
+    if isinstance(item.get("task"), str):
+        batch["task"] = item["task"]
     for cam_key in camera_keys:
         if cam_key in batch and batch[cam_key].dtype == torch.uint8:
             batch[cam_key] = batch[cam_key].float() / 255.0
@@ -606,6 +652,18 @@ def solve_ik(
     return left_tcp, right_tcp, left_err, right_err, left_rot_err, right_rot_err
 
 
+def make_processors(cfg, dataset_stats: dict):
+    if cfg.type == "act":
+        from lerobot.policies.act.processor_act import make_act_pre_post_processors
+
+        return make_act_pre_post_processors(cfg, dataset_stats=dataset_stats)
+    if cfg.type == "pi0":
+        from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
+
+        return make_pi0_pre_post_processors(cfg, dataset_stats=dataset_stats)
+    raise ValueError(f"unsupported policy type for MuJoCo rollout: {cfg.type}")
+
+
 def load_policy(args: argparse.Namespace, meta_dataset: LeRobotDataset):
     cfg = PreTrainedConfig.from_pretrained(args.policy_path)
     cfg.device = args.device
@@ -616,13 +674,24 @@ def load_policy(args: argparse.Namespace, meta_dataset: LeRobotDataset):
     policy = make_policy(cfg, ds_meta=meta_dataset.meta)
     policy.eval()
     policy.reset()
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg,
-        pretrained_path=args.policy_path,
-        preprocessor_overrides={"device_processor": {"device": args.device}},
-        postprocessor_overrides={"device_processor": {"device": args.device}},
-    )
+    preprocessor, postprocessor = make_processors(cfg, meta_dataset.meta.stats)
     return policy, preprocessor, postprocessor
+
+
+def replace_relative_policy_state(batch: dict[str, torch.Tensor], gripper_width: float) -> None:
+    """Replace state with current-TCP identity pose and simulated gripper feedback."""
+    current = batch["observation.state"]
+    state = np.array(
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, gripper_width],
+        dtype=np.float32,
+    )
+    value = torch.as_tensor(state, dtype=current.dtype, device=current.device).unsqueeze(0)
+    if tuple(value.shape) != tuple(current.shape):
+        raise ValueError(
+            f"relative rollout state shape {tuple(value.shape)} does not match "
+            f"dataset state shape {tuple(current.shape)}"
+        )
+    batch["observation.state"] = value
 
 
 def main() -> None:
@@ -641,7 +710,16 @@ def main() -> None:
         "--policy-action-steps",
         type=int,
         default=1,
-        help="Number of predicted ACT actions to consume before recomputing from a new observation.",
+        help="Number of predicted policy actions to consume before recomputing from a new observation.",
+    )
+    parser.add_argument(
+        "--policy-state-source",
+        choices=["dataset", "relative-rollout"],
+        default="dataset",
+        help=(
+            "Policy observation.state source. relative-rollout uses the current-TCP identity pose "
+            "and feeds the previous simulated gripper command back as state."
+        ),
     )
     parser.add_argument("--video-backend", default="pyav")
     parser.add_argument("--fps", type=int, default=10)
@@ -668,6 +746,11 @@ def main() -> None:
     parser.add_argument("--right-work-start-euler", type=parse_vec3, default=None)
     parser.add_argument("--initial-left-q", type=parse_vec7)
     parser.add_argument("--initial-right-q", type=parse_vec7)
+    parser.add_argument(
+        "--start-pose-config",
+        type=Path,
+        help="Canonical G1+PIKA start pose JSON; supplies arm q and validates it against the URDF.",
+    )
     parser.add_argument("--use-initial-q-as-work-start", action="store_true")
     parser.add_argument("--ik-iterations", type=int, default=35)
     parser.add_argument("--ik-damping", type=float, default=0.04)
@@ -713,8 +796,24 @@ def main() -> None:
     parser.add_argument("--viewer-realtime", type=float, default=1.0)
     args = parser.parse_args()
 
+    start_pose_config = None
+    if args.start_pose_config is not None:
+        start_pose_config = load_start_pose_config(args.start_pose_config)
+        config_left_q = np.asarray(start_pose_config["left_arm_q_g1_rad"], dtype=np.float64)
+        config_right_q = np.asarray(start_pose_config["right_arm_q_g1_rad"], dtype=np.float64)
+        if config_left_q.shape != (7,) or config_right_q.shape != (7,):
+            raise ValueError("start pose arm joint arrays must each contain 7 values")
+        if args.initial_left_q is not None and not np.allclose(args.initial_left_q, config_left_q):
+            raise ValueError("--initial-left-q conflicts with --start-pose-config")
+        if args.initial_right_q is not None and not np.allclose(args.initial_right_q, config_right_q):
+            raise ValueError("--initial-right-q conflicts with --start-pose-config")
+        args.initial_left_q = config_left_q
+        args.initial_right_q = config_right_q
+
     if args.source == "policy" and args.policy_path is None:
         raise ValueError("--policy-path is required when --source policy")
+    if args.source != "policy" and args.policy_state_source != "dataset":
+        raise ValueError("--policy-state-source is only valid when --source policy")
     if args.policy_action_steps <= 0:
         raise ValueError("--policy-action-steps must be positive")
     if (args.initial_left_q is None) != (args.initial_right_q is None):
@@ -777,6 +876,21 @@ def main() -> None:
         from lerobot.robots.unitree_g1_pika.g1_pika_kinematics import G1PikaArmIK
 
         unitree_ik = G1PikaArmIK()
+        if start_pose_config is not None:
+            initial_q_g1 = np.concatenate([args.initial_left_q, args.initial_right_q])
+            start_pos_err, start_rot_err = validate_start_pose_fk(
+                unitree_ik, start_pose_config, initial_q_g1
+            )
+            print(f"start_pose_config: {start_pose_config['_path']}")
+            print(f"start_pose_name  : {start_pose_config['name']}")
+            print(
+                "start_pose_right_tcp_pelvis_m: "
+                f"{np.asarray(start_pose_config['right_pika_tcp']['position_pelvis_m'])}"
+            )
+            print(
+                "start_pose_fk_validation: OK "
+                f"(position={start_pos_err:.3e}m rotation={start_rot_err:.3e}rad)"
+            )
 
     model = mujoco.MjModel.from_xml_path(str(scene_xml))
     data = mujoco.MjData(model)
@@ -873,14 +987,25 @@ def main() -> None:
     if action_dim not in {10, 20}:
         raise ValueError(f"unsupported action dimension: {action_dim}")
 
+    rollout_gripper_width = float(first_item["observation.state"][-1])
     if args.source == "teacher":
         first_left_raw, first_left_rot, first_right_raw, first_right_rot = action_pose(
             first_item["action"], use_row_pose6d=args.use_row_pose6d, single_arm=single_arm
         )
+    elif args.action_reference == "relative-delta":
+        # Relative actions are integrated from the configured home pose, so no
+        # policy action is needed to establish an absolute-action baseline.
+        first_left_raw = np.zeros(3, dtype=np.float64)
+        first_right_raw = np.zeros(3, dtype=np.float64)
+        first_left_rot = np.eye(3, dtype=np.float64)
+        first_right_rot = np.eye(3, dtype=np.float64)
     else:
         assert policy is not None and preprocessor is not None and postprocessor is not None
         with torch.no_grad():
-            first_obs = preprocessor(prepare_batch(first_item, dataset.meta.camera_keys))
+            first_batch = prepare_batch(first_item, dataset.meta.camera_keys)
+            if args.policy_state_source == "relative-rollout":
+                replace_relative_policy_state(first_batch, rollout_gripper_width)
+            first_obs = preprocessor(first_batch)
             first_pred = postprocessor(policy.select_action(first_obs)).squeeze(0).cpu()
         first_left_raw, first_left_rot, first_right_raw, first_right_rot = action_pose(
             first_pred, use_row_pose6d=args.use_row_pose6d, single_arm=single_arm
@@ -952,10 +1077,22 @@ def main() -> None:
             item = dataset[dataset_idx]
             if args.source == "teacher":
                 source_action = item["action"]
+                policy_state_gripper = float(item["observation.state"][-1])
             else:
                 assert policy is not None and preprocessor is not None and postprocessor is not None
-                obs = preprocessor(prepare_batch(item, dataset.meta.camera_keys))
+                batch = prepare_batch(item, dataset.meta.camera_keys)
+                policy_state_gripper = (
+                    rollout_gripper_width
+                    if args.policy_state_source == "relative-rollout"
+                    else float(item["observation.state"][-1])
+                )
+                if args.policy_state_source == "relative-rollout":
+                    replace_relative_policy_state(batch, policy_state_gripper)
+                obs = preprocessor(batch)
                 source_action = postprocessor(policy.select_action(obs)).squeeze(0).cpu()
+                rollout_gripper_width = float(
+                    np.clip(float(source_action[-1]), 0.0, args.gripper_open_width)
+                )
 
             left_raw, left_rot, right_raw, right_rot = action_pose(
                 source_action, use_row_pose6d=args.use_row_pose6d, single_arm=single_arm
@@ -1157,6 +1294,7 @@ def main() -> None:
                 "left_rot_err_rad": left_rot_err,
                 "right_rot_err_rad": right_rot_err,
                 "mean_rot_err_rad": (left_rot_err + right_rot_err) / 2.0,
+                "policy_state_gripper": policy_state_gripper,
                 "left_target_x": float(left_target[0]),
                 "left_target_y": float(left_target[1]),
                 "left_target_z": float(left_target[2]),
