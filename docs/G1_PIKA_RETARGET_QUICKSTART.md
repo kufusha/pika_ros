@@ -238,7 +238,32 @@ for ep in $(seq 0 59); do
 done
 ```
 
-## 6. リターゲット済みCSVを実機で確認
+## 6. Policy checkpointをオフライン確認
+
+ACT/PI0とも、実機へ接続する前に収録済み観測に対するaction誤差を確認します。以下は
+`POLICY_ACTION_STEPS=8`で学習・検証したPI0の例です。
+
+```bash
+cd "$WORKSPACE/src/pika_ros"
+
+PYTHONPATH="$WORKSPACE/src/lerobot/src" \
+python scripts/replay_lerobot_policy_eval.py \
+  --policy-path /path/to/checkpoint/pretrained_model \
+  --dataset-root "$WORKSPACE/datasets/g1_pika_relative" \
+  --repo-id <dataset-repo-id> \
+  --episodes 0,10,20,30,40 \
+  --max-steps 64 \
+  --device cuda \
+  --policy-action-steps 8 \
+  --mode select_action
+```
+
+`relative_improvement_vs_no_motion`、次元別誤差、episode別の最大誤差を確認してください。
+タスク文字列はdataset itemの `task` が使用されるため、dataset metadataも事前に確認します。
+続いて `run_policy_updated_urdf_ik_mujoco.bash` でpolicy軌道を動画化します。詳しい手順と
+実機policy試験は [G1_PIKA_RETARGETING.md](G1_PIKA_RETARGETING.md) を参照してください。
+
+## 7. リターゲット済みCSVを実機で確認
 
 MuJoCo確認済みCSVを、最初は5stepだけ再生します。
 
@@ -260,7 +285,7 @@ scripts/run_policy_ik_from_current_fk.sh
 
 実機試験中はアームを支持し、`Ctrl-C` 後にpassiveになることを前提にしてください。
 
-## 7. よくあるエラー
+## 8. よくあるエラー
 
 `G1_PIKA_URDF was not found`:
 
